@@ -3,6 +3,7 @@ import type { AssistantMessage, Context, Model } from "@earendil-works/pi-ai";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	type CompactionPreparation,
+	type CompactionSettings,
 	compact,
 	completeSummarization,
 	generateSummary,
@@ -28,7 +29,7 @@ function createModel(
 ): Model<"anthropic-messages"> {
 	return {
 		id: reasoning ? "reasoning-model" : "non-reasoning-model",
-		name: reasoning ? "Reasoning Model" : "Non-reasoning Model",
+		name: reasoning ? "Reasoning Model" : "Non-Reasoning Model",
 		api: "anthropic-messages",
 		provider: "anthropic",
 		baseUrl: "https://api.anthropic.com",
@@ -38,6 +39,15 @@ function createModel(
 		contextWindow: 200000,
 		maxTokens,
 		...(compat ? { compat } : {}),
+	};
+}
+
+function makeSettings(overrides: Partial<CompactionSettings> = {}): CompactionSettings {
+	return {
+		enabled: true,
+		reserveTokens: 2000,
+		keepRecentTokens: 20000,
+		...overrides,
 	};
 }
 
@@ -73,11 +83,11 @@ describe("generateSummary reasoning options", () => {
 		completeSimpleMock.mockResolvedValue(mockSummaryResponse);
 	});
 
-	it("uses the provided thinking level for reasoning-capable models", async () => {
+	it("uses the provided thinking level for reasoning-capable models when the setting inherits", async () => {
 		const result = await generateSummaryWithUsage(
 			messages,
 			createModel(true),
-			2000,
+			makeSettings({ thinkingLevel: "inherit" }),
 			"test-key",
 			undefined,
 			undefined,
@@ -96,15 +106,34 @@ describe("generateSummary reasoning options", () => {
 		});
 	});
 
+	it("overrides the session thinking level with the compaction setting", async () => {
+		await generateSummaryWithUsage(
+			messages,
+			createModel(true),
+			makeSettings({ thinkingLevel: "low" }),
+			"test-key",
+			undefined,
+			undefined,
+			undefined,
+			undefined,
+			"xhigh",
+		);
+
+		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
+		expect(completeSimpleMock.mock.calls[0][2]).toMatchObject({
+			reasoning: "low",
+		});
+	});
+
 	it("preserves the string result from generateSummary", async () => {
-		await expect(generateSummary(messages, createModel(false), 2000, "test-key")).resolves.toBe(
+		await expect(generateSummary(messages, createModel(false), makeSettings(), "test-key")).resolves.toBe(
 			"## Goal\nTest summary",
 		);
 	});
 
 	it("uses fresh routing sessions without prompt caching", async () => {
-		await generateSummary(messages, createModel(false), 2000, "test-key");
-		await generateSummary(messages, createModel(false), 2000, "test-key");
+		await generateSummary(messages, createModel(false), makeSettings(), "test-key");
+		await generateSummary(messages, createModel(false), makeSettings(), "test-key");
 
 		const requestOptions = completeSimpleMock.mock.calls.map((call) => call[2]);
 		expect(requestOptions).toHaveLength(2);
@@ -150,7 +179,7 @@ describe("generateSummary reasoning options", () => {
 	it("rejects tool calls from conversation summaries", async () => {
 		completeSimpleMock.mockResolvedValueOnce(mockToolCallResponse);
 
-		await expect(generateSummaryWithUsage(messages, createModel(false), 2000, "test-key")).rejects.toThrow(
+		await expect(generateSummaryWithUsage(messages, createModel(false), makeSettings(), "test-key")).rejects.toThrow(
 			"Summarization attempted to call a tool",
 		);
 	});
@@ -172,24 +201,40 @@ describe("generateSummary reasoning options", () => {
 		);
 	});
 
-	it("rejects a length-limited history summary", async () => {
-		completeSimpleMock.mockResolvedValueOnce({
-			...mockSummaryResponse,
-			stopReason: "length",
-			content: [{ type: "text", text: "partial" }],
-		});
+	it("retries a length-limited history summary at the model output cap", async () => {
+		const model = createModel(false, 32768);
+		completeSimpleMock
+			.mockResolvedValueOnce({
+				...mockSummaryResponse,
+				stopReason: "length",
+				content: [{ type: "text", text: "partial" }],
+			})
+			.mockResolvedValueOnce({
+				...mockSummaryResponse,
+				content: [{ type: "text", text: "full summary" }],
+			});
 
-		await expect(generateSummaryWithUsage(messages, createModel(false), 2000, "test-key")).rejects.toThrow(
-			"generation hit the token cap",
-		);
+		const result = await generateSummaryWithUsage(messages, model, makeSettings(), "test-key");
+
+		expect(result.text).toBe("full summary");
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+		// First attempt: the settings-derived cap; the retry: the model's full budget.
+		expect(completeSimpleMock.mock.calls[0][2]?.maxTokens).toBe(Math.floor(0.8 * 22000));
+		expect(completeSimpleMock.mock.calls[1][2]?.maxTokens).toBe(32768);
 	});
 
-	it("rejects a length-limited split-turn summary", async () => {
-		completeSimpleMock.mockResolvedValueOnce({
-			...mockSummaryResponse,
-			stopReason: "length",
-			content: [{ type: "text", text: "partial" }],
-		});
+	it("retries a length-limited split-turn summary at the model output cap", async () => {
+		const model = createModel(false, 32768);
+		completeSimpleMock
+			.mockResolvedValueOnce({
+				...mockSummaryResponse,
+				stopReason: "length",
+				content: [{ type: "text", text: "partial" }],
+			})
+			.mockResolvedValueOnce({
+				...mockSummaryResponse,
+				content: [{ type: "text", text: "prefix summary" }],
+			});
 		const preparation: CompactionPreparation = {
 			firstKeptEntryId: "entry-keep",
 			messagesToSummarize: [],
@@ -200,7 +245,26 @@ describe("generateSummary reasoning options", () => {
 			settings: { enabled: true, reserveTokens: 2000, keepRecentTokens: 20 },
 		};
 
-		await expect(compact(preparation, createModel(false), "test-key")).rejects.toThrow(
+		const result = await compact(preparation, model, "test-key");
+
+		expect(result.summary).toContain("No prior history.");
+		expect(result.summary).toContain("prefix summary");
+		expect(completeSimpleMock).toHaveBeenCalledTimes(2);
+		// First attempt: the (smaller) turn prefix cap; the retry: the model's full budget.
+		expect(completeSimpleMock.mock.calls[0][2]?.maxTokens).toBe(Math.floor(0.5 * 2020));
+		expect(completeSimpleMock.mock.calls[1][2]?.maxTokens).toBe(32768);
+	});
+
+	it("still fails a length-limited summary that also hits the model output cap", async () => {
+		// Cap already at the model ceiling: the retry cannot raise it.
+		const model = createModel(false, 8192);
+		completeSimpleMock.mockResolvedValue({
+			...mockSummaryResponse,
+			stopReason: "length",
+			content: [{ type: "text", text: "partial" }],
+		});
+
+		await expect(generateSummaryWithUsage(messages, model, makeSettings(), "test-key")).rejects.toThrow(
 			"generation hit the token cap",
 		);
 	});
@@ -209,7 +273,7 @@ describe("generateSummary reasoning options", () => {
 		await generateSummary(
 			messages,
 			createModel(true),
-			2000,
+			makeSettings(),
 			"test-key",
 			undefined,
 			undefined,
@@ -229,7 +293,7 @@ describe("generateSummary reasoning options", () => {
 		await generateSummary(
 			messages,
 			createModel(false),
-			2000,
+			makeSettings(),
 			"test-key",
 			undefined,
 			undefined,
@@ -257,7 +321,7 @@ describe("generateSummary reasoning options", () => {
 					},
 				],
 			}),
-			2000,
+			makeSettings(),
 			"test-key",
 		);
 
@@ -266,7 +330,7 @@ describe("generateSummary reasoning options", () => {
 	});
 
 	it("does not set Anthropic refusal fallback for models without allowed fallback targets", async () => {
-		await generateSummary(messages, createModel(true), 2000, "test-key");
+		await generateSummary(messages, createModel(true), makeSettings(), "test-key");
 
 		expect(completeSimpleMock).toHaveBeenCalledTimes(1);
 		expect(completeSimpleMock.mock.calls[0][2]).not.toHaveProperty("refusalFallbacks");

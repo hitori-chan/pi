@@ -123,16 +123,29 @@ function combineUsage(first: Usage, second: Usage): Usage {
 // Types
 // ============================================================================
 
+/**
+ * Thinking level for the summarization call. "inherit" uses the session's
+ * current level; any concrete level overrides it. Summarization is a bounded
+ * extraction task, so the default is "off": unbounded session reasoning
+ * (e.g. xhigh) can otherwise consume the whole output cap and fail the run.
+ */
+export type CompactionThinkingLevel = ThinkingLevel | "inherit";
+
 export interface CompactionSettings {
 	enabled: boolean;
 	reserveTokens: number;
 	keepRecentTokens: number;
+	thinkingLevel?: CompactionThinkingLevel;
+	/** Steer a running tool loop to wrap up this many tokens before the line. */
+	midRunReserveTokens?: number;
 }
 
 export const DEFAULT_COMPACTION_SETTINGS: CompactionSettings = {
 	enabled: true,
 	reserveTokens: 16384,
 	keepRecentTokens: 20000,
+	thinkingLevel: "off",
+	midRunReserveTokens: 16384,
 };
 
 // ============================================================================
@@ -605,7 +618,7 @@ export async function completeSummarization(
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	settings: CompactionSettings,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
@@ -622,7 +635,7 @@ export async function generateSummary(
 		await generateSummaryWithUsage(
 			currentMessages,
 			model,
-			reserveTokens,
+			settings,
 			apiKey,
 			headers,
 			signal,
@@ -656,7 +669,7 @@ function buildSummarizationContext(promptText: string): Context {
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	settings: CompactionSettings,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
@@ -669,10 +682,18 @@ export async function generateSummaryWithUsage(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
+	// The summarization input excludes the kept recent messages, so the
+	// provider actually has reserveTokens + keepRecentTokens of output room at
+	// the compaction line; the 0.8 factor absorbs overshoot past the line.
 	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
+		Math.floor(0.8 * (settings.reserveTokens + settings.keepRecentTokens)),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
+	// The session's thinking level is only honored when the setting opts in.
+	const effectiveThinkingLevel =
+		settings.thinkingLevel === undefined || settings.thinkingLevel === "inherit"
+			? thinkingLevel
+			: settings.thinkingLevel;
 
 	// Use update prompt if we have a previous summary, otherwise initial prompt
 	let basePrompt = previousSummary ? UPDATE_SUMMARIZATION_PROMPT : SUMMARIZATION_PROMPT;
@@ -692,6 +713,7 @@ export async function generateSummaryWithUsage(
 	}
 	promptText += basePrompt;
 
+	const context = buildSummarizationContext(promptText);
 	const completionOptions = createSummarizationOptions(
 		model,
 		maxTokens,
@@ -699,18 +721,17 @@ export async function generateSummaryWithUsage(
 		headers,
 		env,
 		signal,
-		thinkingLevel,
+		effectiveThinkingLevel,
 		sessionId,
 	);
 
-	const response = await completeSummarization(
-		model,
-		buildSummarizationContext(promptText),
-		completionOptions,
-		streamFn,
-		retry,
-		callbacks,
-	);
+	let response = await completeSummarization(model, context, completionOptions, streamFn, retry, callbacks);
+	// A length stop means the summary (or its reasoning) outgrew the cap:
+	// retry once with the model's full output budget before failing.
+	if (response.stopReason === "length" && model.maxTokens > 0 && maxTokens < model.maxTokens) {
+		completionOptions.maxTokens = model.maxTokens;
+		response = await completeSummarization(model, context, completionOptions, streamFn, retry, callbacks);
+	}
 
 	const failure = getSummarizationFailure(response, "Summarization");
 	if (failure) {
@@ -891,7 +912,7 @@ export async function compact(
 			const historyResult = await generateSummaryWithUsage(
 				messagesToSummarize,
 				model,
-				settings.reserveTokens,
+				settings,
 				apiKey,
 				headers,
 				signal,
@@ -910,7 +931,7 @@ export async function compact(
 		const turnPrefixResult = await generateTurnPrefixSummary(
 			turnPrefixMessages,
 			model,
-			settings.reserveTokens,
+			settings,
 			apiKey,
 			headers,
 			env,
@@ -929,7 +950,7 @@ export async function compact(
 		const result = await generateSummaryWithUsage(
 			messagesToSummarize,
 			model,
-			settings.reserveTokens,
+			settings,
 			apiKey,
 			headers,
 			signal,
@@ -969,7 +990,7 @@ export async function compact(
 async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	settings: CompactionSettings,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	env?: Record<string, string>,
@@ -980,22 +1001,35 @@ async function generateTurnPrefixSummary(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
+	// Smaller budget for turn prefix (same kept-recent slack as the main summary).
 	const maxTokens = Math.min(
-		Math.floor(0.5 * reserveTokens),
+		Math.floor(0.5 * (settings.reserveTokens + settings.keepRecentTokens)),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	); // Smaller budget for turn prefix
+	);
+	const effectiveThinkingLevel =
+		settings.thinkingLevel === undefined || settings.thinkingLevel === "inherit"
+			? thinkingLevel
+			: settings.thinkingLevel;
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
 	const promptText = `<conversation>\n${conversationText}\n</conversation>\n\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 
-	const response = await completeSummarization(
+	const context = buildSummarizationContext(promptText);
+	const completionOptions = createSummarizationOptions(
 		model,
-		buildSummarizationContext(promptText),
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
-		streamFn,
-		retry,
-		callbacks,
+		maxTokens,
+		apiKey,
+		headers,
+		env,
+		signal,
+		effectiveThinkingLevel,
+		sessionId,
 	);
+	let response = await completeSummarization(model, context, completionOptions, streamFn, retry, callbacks);
+	if (response.stopReason === "length" && model.maxTokens > 0 && maxTokens < model.maxTokens) {
+		completionOptions.maxTokens = model.maxTokens;
+		response = await completeSummarization(model, context, completionOptions, streamFn, retry, callbacks);
+	}
 
 	const failure = getSummarizationFailure(response, "Turn prefix summarization");
 	if (failure) {

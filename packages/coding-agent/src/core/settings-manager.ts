@@ -8,12 +8,17 @@ import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
+import type { CompactionThinkingLevel } from "./compaction/compaction.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
+	/** Summarizer thinking level; "inherit" = session level. Default: "off" */
+	thinkingLevel?: CompactionThinkingLevel;
+	/** Steer a running tool loop to wrap up this many tokens before the line. Default: 16384 */
+	midRunReserveTokens?: number;
 }
 
 export interface BranchSummarySettings {
@@ -847,11 +852,27 @@ export class SettingsManager {
 		return this.settings.compaction?.keepRecentTokens ?? 20000;
 	}
 
-	getCompactionSettings(): { enabled: boolean; reserveTokens: number; keepRecentTokens: number } {
+	getCompactionThinkingLevel(): CompactionThinkingLevel {
+		return this.settings.compaction?.thinkingLevel ?? "off";
+	}
+
+	getCompactionMidRunReserveTokens(): number {
+		return this.settings.compaction?.midRunReserveTokens ?? 16384;
+	}
+
+	getCompactionSettings(): {
+		enabled: boolean;
+		reserveTokens: number;
+		keepRecentTokens: number;
+		thinkingLevel: CompactionThinkingLevel;
+		midRunReserveTokens: number;
+	} {
 		return {
 			enabled: this.getCompactionEnabled(),
 			reserveTokens: this.getCompactionReserveTokens(),
 			keepRecentTokens: this.getCompactionKeepRecentTokens(),
+			thinkingLevel: this.getCompactionThinkingLevel(),
+			midRunReserveTokens: this.getCompactionMidRunReserveTokens(),
 		};
 	}
 
