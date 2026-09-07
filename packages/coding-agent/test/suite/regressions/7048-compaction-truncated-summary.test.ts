@@ -40,7 +40,11 @@ describe("#7048 truncated compaction summaries", () => {
 	it("does not persist a length-limited summary", async () => {
 		harness = await createHarness();
 		seedCompactableSession(harness);
-		harness.setResponses([fauxAssistantMessage("partial summar", { stopReason: "length" })]);
+		// First attempt hits the settings-derived cap; the retry hits the model cap.
+		harness.setResponses([
+			fauxAssistantMessage("partial summar", { stopReason: "length" }),
+			fauxAssistantMessage("partial summar still", { stopReason: "length" }),
+		]);
 
 		await expect(harness.session.compact()).rejects.toThrow("generation hit the token cap");
 		expect(harness.sessionManager.getEntries().filter((entry) => entry.type === "compaction")).toHaveLength(0);

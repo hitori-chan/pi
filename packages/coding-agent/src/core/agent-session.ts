@@ -61,6 +61,7 @@ import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
 	type CompactionPreparation,
 	type CompactionResult,
+	type CompactionSettings,
 	calculateContextTokens,
 	collectEntriesForBranchSummary,
 	compact,
@@ -68,8 +69,15 @@ import {
 	estimateProjectedContextTokens,
 	estimateTokens,
 	generateBranchSummary,
+	MAX_NUDGES_PER_RUN,
+	MIDRUN_CUSTOM_TYPE,
 	prepareCompaction,
+	RESUME_PROMPT_COMPACTED,
+	RESUME_PROMPT_PLAIN,
+	rearmDeltaTokens,
+	reSteerPrompt,
 	shouldCompact,
+	steerPrompt,
 } from "./compaction/index.ts";
 import { DEFAULT_THINKING_LEVEL, THINKING_LEVEL_OPTIONS } from "./defaults.ts";
 import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.ts";
@@ -354,6 +362,13 @@ export class AgentSession {
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
 
+	// Mid-run convergence steering state (see compaction/midrun.ts).
+	private _midrunNudges = 0;
+	private _midrunAwaitingSettle = false;
+	private _midrunResumeAtSettle = false;
+	private _midrunLastSteerTokens = 0;
+	private _midrunCompactedSinceSteer = false;
+
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
 
@@ -589,6 +604,10 @@ export class AgentSession {
 		const settings = this.settingsManager.getCompactionSettings(model);
 		const projection = this.sessionManager.buildSessionProjection();
 
+		if (model && model.contextWindow > 0 && settings.enabled) {
+			this._midrunMaybeSteer(projection.messages, model, settings);
+		}
+
 		if (
 			!model ||
 			model.contextWindow <= 0 ||
@@ -682,6 +701,101 @@ export class AgentSession {
 			if (extensionContinue || previousDecision?.action === "continue") return { action: "continue" };
 			return undefined;
 		};
+	}
+
+	/** Begin a new agent run: close the previous run's steering window. */
+	private _midrunBeginRun(): void {
+		this._midrunNudges = 0;
+		this._midrunAwaitingSettle = false;
+	}
+
+	/**
+	 * Quiet mid-run convergence steering. When a still-running tool loop crosses
+	 * the steer line (pi's compaction line by default), ask the model invisibly
+	 * to converge in-flight work and end the turn, so pi's native compaction
+	 * runs on a settled state. Only "toolUse" stops are steered: "stop" ends the
+	 * run (boundary compaction handles it); "length"/"error"/"aborted" belong to
+	 * pi's recovery, retry, and the user.
+	 */
+	private _midrunMaybeSteer(messages: AgentMessage[], model: Model<any>, settings: CompactionSettings): void {
+		if (!this.isStreaming) return;
+
+		let lastAssistant: AssistantMessage | undefined;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			if (messages[i].role === "assistant") {
+				lastAssistant = messages[i] as AssistantMessage;
+				break;
+			}
+		}
+		if (!lastAssistant || lastAssistant.stopReason !== "toolUse") return;
+		const usage = lastAssistant.usage;
+		if (!usage) return;
+		const tokens = calculateContextTokens(usage);
+		if (tokens <= 0) return;
+
+		// Steer at or before pi's hard compaction line, so the wrap-up pushes
+		// usage over it and the compaction reliably runs. When the reserve
+		// exceeds the window there is no mid-run zone to steer toward.
+		const reserve = Math.max(this.settingsManager.getCompactionMidRunReserveTokens(), settings.reserveTokens);
+		if (reserve >= model.contextWindow) return;
+		const threshold = model.contextWindow - reserve;
+		const rearmDelta = rearmDeltaTokens(model.contextWindow);
+
+		let phase: "steer" | "re-steer";
+		if (this._midrunAwaitingSettle) {
+			// Already steered this run: at most one stronger re-nudge, and only
+			// after real growth since the last steer.
+			if (this._midrunNudges >= MAX_NUDGES_PER_RUN) return;
+			if (tokens < this._midrunLastSteerTokens + rearmDelta) return;
+			phase = "re-steer";
+		} else {
+			if (tokens < threshold) return;
+			// Cross-run hysteresis: after a steer whose wrap-up settled below the
+			// line, usage is already above the threshold again — wait for real
+			// growth before steering the next run.
+			if (this._midrunLastSteerTokens > 0 && tokens < this._midrunLastSteerTokens + rearmDelta) return;
+			phase = "steer";
+		}
+
+		this._midrunAwaitingSettle = true;
+		this._midrunNudges += 1;
+		this._midrunLastSteerTokens = tokens;
+		// A new steer opens a fresh "did pi compact?" window.
+		this._midrunCompactedSinceSteer = false;
+		const pct = Math.round((tokens / model.contextWindow) * 100);
+		this._logMidrun({ phase, tokens, threshold, window: model.contextWindow });
+
+		// Invisible to the UI, visible to the model. The steering queue is
+		// drained before the next assistant response; nothing in flight aborts.
+		void this.sendCustomMessage(
+			{
+				customType: MIDRUN_CUSTOM_TYPE,
+				content: phase === "steer" ? steerPrompt(pct) : reSteerPrompt(pct),
+				display: false,
+			},
+			{ deliverAs: "steer" },
+		);
+	}
+
+	/** Best-effort diagnostic entry in the session file (invisible custom entry). */
+	private _logMidrun(data: Record<string, unknown>): void {
+		try {
+			this.sessionManager.appendCustomEntry(MIDRUN_CUSTOM_TYPE, data);
+		} catch {
+			// Diagnostics are best-effort.
+		}
+	}
+
+	/**
+	 * Record that a compaction landed (shared by manual and automatic paths).
+	 * If the steered run is still in flight, anchor the re-arm point to the
+	 * pre-compaction level (only real regrowth re-arms); otherwise the old
+	 * anchor is stale and the next fresh steer must not be delayed.
+	 */
+	private _midrunNoteCompaction(tokensBefore: number, reason: string, willRetry: boolean): void {
+		this._midrunCompactedSinceSteer = true;
+		this._midrunLastSteerTokens = this._midrunAwaitingSettle ? tokensBefore : 0;
+		this._logMidrun({ phase: "compacted", reason, willRetry, tokensBefore });
 	}
 
 	private _installAgentNextTurnRefresh(): void {
@@ -843,6 +957,13 @@ export class AgentSession {
 	}
 
 	private async _emitSessionCompactFailed(event: Omit<SessionCompactFailedEvent, "type">): Promise<void> {
+		this._logMidrun({
+			phase: "compact-failed",
+			reason: event.reason,
+			aborted: event.aborted,
+			willRetry: event.willRetry,
+			errorMessage: event.errorMessage,
+		});
 		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
 			await this._extensionRunner.emit({ type: "session_compact_failed", ...event });
 		}
@@ -1469,6 +1590,7 @@ export class AgentSession {
 		this._agentRunAbortRequested = false;
 		this._isAgentRunActive = true;
 		try {
+			this._midrunBeginRun();
 			await this.agent.prompt(messages);
 			while (!this._agentRunAbortRequested) {
 				if (await this._handlePostAgentRun()) {
@@ -1478,6 +1600,7 @@ export class AgentSession {
 				}
 				if (this._agentRunAbortRequested || !(await this._runBeforeSettleBoundary())) break;
 				if (this._agentRunAbortRequested) break;
+				this._midrunBeginRun();
 				await this.agent.continue();
 			}
 		} finally {
@@ -1519,13 +1642,57 @@ export class AgentSession {
 			this._retryAttempt = 0;
 		}
 
+		// Mid-run steering: capture the resume decision at run end, before the
+		// post-run compaction and continuation runs below.
+		if (this._midrunAwaitingSettle) {
+			this._midrunAwaitingSettle = false;
+			// Resume only a run that (a) stopped cleanly — aborts belong to the
+			// user, errors to pi's retry, "length" to pi's overflow recovery —
+			// and (b) was actually compacted mid-run. A steered run that stops
+			// on its own (with or without post-run boundary compaction) is a
+			// finished turn: resuming it would restart finished work.
+			if (message.stopReason !== "stop") {
+				this._logMidrun({ phase: "resume-skipped", stopReason: message.stopReason });
+			} else if (this._midrunCompactedSinceSteer) {
+				this._midrunResumeAtSettle = true;
+			} else {
+				this._logMidrun({ phase: "settled" });
+			}
+		}
+
 		if (await this._checkCompaction(message, true, toolResults)) {
 			return !this._agentRunAbortRequested;
 		}
 
 		// The low-level loop drains both queues before agent_end. Messages queued by
 		// agent_end handlers require a fresh run before pre-settlement handlers fire.
-		return !this._agentRunAbortRequested && this.agent.hasQueuedMessages();
+		// Fork: user takeover cancels the pending auto-resume.
+		if (this.agent.hasQueuedMessages()) {
+			if (this._midrunResumeAtSettle) {
+				// The user took over: cancel the pending auto-resume.
+				this._midrunResumeAtSettle = false;
+				this._logMidrun({ phase: "resume-cancelled" });
+			}
+			return !this._agentRunAbortRequested;
+		}
+
+		// Fully settled: a steered, cleanly stopped run resumes via an invisible
+		// follow-up turn — following the compaction summary when one was produced.
+		if (this._midrunResumeAtSettle && !this._agentRunAbortRequested) {
+			this._midrunResumeAtSettle = false;
+			const compacted = this._midrunCompactedSinceSteer;
+			this._logMidrun({ phase: "resuming", compacted });
+			this.agent.followUp({
+				role: "custom",
+				customType: MIDRUN_CUSTOM_TYPE,
+				content: compacted ? RESUME_PROMPT_COMPACTED : RESUME_PROMPT_PLAIN,
+				display: false,
+				timestamp: Date.now(),
+			});
+			return true;
+		}
+
+		return false;
 	}
 
 	private async _runBeforeSettleBoundary(): Promise<boolean> {
@@ -2374,13 +2541,22 @@ export class AgentSession {
 			headers,
 			customInstructions,
 			signal,
-			this.thinkingLevel,
+			this._resolveCompactionThinkingLevel(),
 			this.agent.streamFunction,
 			env,
 			this.settingsManager.getRetrySettings(),
 			this._summarizationRetryCallbacks({ source: "compaction", reason }),
 			undefined, // sessionId
 		);
+	}
+
+	/**
+	 * Resolve the summarizer's thinking level: the setting wins unless it is
+	 * "inherit", in which case the session's current level is used.
+	 */
+	private _resolveCompactionThinkingLevel(): ThinkingLevel {
+		const level = this.settingsManager.getCompactionThinkingLevel();
+		return level === "inherit" ? this.thinkingLevel : level;
 	}
 
 	private _clearManualCompactionState(): void {
@@ -2497,6 +2673,7 @@ export class AgentSession {
 			}
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this._midrunNoteCompaction(tokensBefore, "manual", false);
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);
@@ -2836,6 +3013,7 @@ export class AgentSession {
 			abortController.signal.throwIfAborted();
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
+			this._midrunNoteCompaction(tokensBefore, reason, willRetry);
 			const newEntries = this.sessionManager.getEntries();
 			this._refreshFinalizedContext();
 			const estimatedTokensAfter = estimateMessagesTokens(this.sessionManager.buildSessionProjection().messages);

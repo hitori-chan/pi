@@ -8,6 +8,7 @@ import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
+
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 
 export interface CompactionModelOverride {
@@ -20,11 +21,23 @@ const DEFAULT_COMPACTION_TOKEN_SETTINGS: Required<CompactionModelOverride> = {
 	keepRecentTokens: 20000,
 };
 
+/**
+ * Thinking level for the summarization call. "inherit" uses the session's
+ * current level; any concrete level overrides it. Summarization is a bounded
+ * extraction task, so the default is "off": unbounded session reasoning
+ * (e.g. xhigh) can otherwise consume the whole output cap and fail the run.
+ */
+export type CompactionThinkingLevel = ThinkingLevel | "inherit";
+
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
 	reserveTokens?: number; // default: 16384
 	keepRecentTokens?: number; // default: 20000
 	modelOverrides?: Record<string, CompactionModelOverride>; // exact "provider/modelId" keys
+	/** Summarizer thinking level; "inherit" = session level. Default: "off" */
+	thinkingLevel?: CompactionThinkingLevel;
+	/** Steer a running tool loop to wrap up this many tokens before the line. Default: 16384 */
+	midRunReserveTokens?: number;
 }
 
 export interface BranchSummarySettings {
@@ -890,6 +903,14 @@ export class SettingsManager {
 
 	getCompactionKeepRecentTokens(model?: Pick<Model<string>, "provider" | "id">): number {
 		return this.getCompactionTokenSetting("keepRecentTokens", model);
+	}
+
+	getCompactionThinkingLevel(): CompactionThinkingLevel {
+		return this.settings.compaction?.thinkingLevel ?? "off";
+	}
+
+	getCompactionMidRunReserveTokens(): number {
+		return this.settings.compaction?.midRunReserveTokens ?? 16384;
 	}
 
 	/** Resolve each token setting through model override, ordinary setting, then built-in default. */

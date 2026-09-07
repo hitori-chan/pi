@@ -125,7 +125,8 @@ describe("AgentSession compaction model overrides", () => {
 		]);
 		if (path === "manual") await harness.session.compact();
 		else await harness.session.prompt("continue");
-		expect(budgets).toEqual([1600]);
+		// Fork: the cap formula includes the kept-recent slack (0.8 * (reserve + keepRecent)).
+		expect(budgets).toEqual([Math.floor(0.8 * (2000 + 150))]);
 		expect(harness.sessionManager.getEntries().find((entry) => entry.type === "compaction")).toMatchObject({
 			firstKeptEntryId: recentUserId,
 			summary: "built-in summary",
@@ -201,6 +202,7 @@ describe("AgentSession compaction model overrides", () => {
 			},
 		]);
 		await harness.session.compact();
-		expect(requests).toEqual([{ id: "first", maxTokens: 1600 }]);
+		// Fork: the cap formula includes the kept-recent slack (0.8 * (reserve + keepRecent)).
+		expect(requests).toEqual([{ id: "first", maxTokens: Math.floor(0.8 * (2000 + 150)) }]);
 	});
 });

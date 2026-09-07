@@ -667,7 +667,7 @@ export async function completeSummarization(
 export async function generateSummary(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	settings: CompactionSettings,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
@@ -684,7 +684,7 @@ export async function generateSummary(
 		await generateSummaryWithUsage(
 			currentMessages,
 			model,
-			reserveTokens,
+			settings,
 			apiKey,
 			headers,
 			signal,
@@ -718,7 +718,7 @@ function buildSummarizationContext(promptText: string): TranscriptContext {
 export async function generateSummaryWithUsage(
 	currentMessages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	settings: CompactionSettings,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
@@ -731,8 +731,11 @@ export async function generateSummaryWithUsage(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
+	// The summarization input excludes the kept recent messages, so the
+	// provider actually has reserveTokens + keepRecentTokens of output room at
+	// the compaction line; the 0.8 factor absorbs overshoot past the line.
 	const maxTokens = Math.min(
-		Math.floor(0.8 * reserveTokens),
+		Math.floor(0.8 * (settings.reserveTokens + settings.keepRecentTokens)),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
 	);
 
@@ -754,6 +757,7 @@ export async function generateSummaryWithUsage(
 	}
 	promptText += basePrompt;
 
+	const context = buildSummarizationContext(promptText);
 	const completionOptions = createSummarizationOptions(
 		model,
 		maxTokens,
@@ -765,14 +769,13 @@ export async function generateSummaryWithUsage(
 		sessionId,
 	);
 
-	const response = await completeSummarization(
-		model,
-		buildSummarizationContext(promptText),
-		completionOptions,
-		streamFn,
-		retry,
-		callbacks,
-	);
+	let response = await completeSummarization(model, context, completionOptions, streamFn, retry, callbacks);
+	// A length stop means the summary (or its reasoning) outgrew the cap:
+	// retry once with the model's full output budget before failing.
+	if (response.stopReason === "length" && model.maxTokens > 0 && maxTokens < model.maxTokens) {
+		completionOptions.maxTokens = model.maxTokens;
+		response = await completeSummarization(model, context, completionOptions, streamFn, retry, callbacks);
+	}
 
 	const failure = getSummarizationFailure(response, "Summarization");
 	if (failure) {
@@ -1020,7 +1023,7 @@ export async function compact(
 			const historyResult = await generateSummaryWithUsage(
 				messagesToSummarize,
 				model,
-				settings.reserveTokens,
+				settings,
 				apiKey,
 				headers,
 				signal,
@@ -1039,7 +1042,7 @@ export async function compact(
 		const turnPrefixResult = await generateTurnPrefixSummary(
 			turnPrefixMessages,
 			model,
-			settings.reserveTokens,
+			settings,
 			apiKey,
 			headers,
 			env,
@@ -1058,7 +1061,7 @@ export async function compact(
 		const result = await generateSummaryWithUsage(
 			messagesToSummarize,
 			model,
-			settings.reserveTokens,
+			settings,
 			apiKey,
 			headers,
 			signal,
@@ -1098,7 +1101,7 @@ export async function compact(
 async function generateTurnPrefixSummary(
 	messages: AgentMessage[],
 	model: Model<any>,
-	reserveTokens: number,
+	settings: CompactionSettings,
 	apiKey: string | undefined,
 	headers?: Record<string, string>,
 	env?: Record<string, string>,
@@ -1109,22 +1112,31 @@ async function generateTurnPrefixSummary(
 	callbacks?: RetryCallbacks,
 	sessionId?: string,
 ): Promise<{ text: string; usage: Usage }> {
+	// Smaller budget for turn prefix (same kept-recent slack as the main summary).
 	const maxTokens = Math.min(
-		Math.floor(0.5 * reserveTokens),
+		Math.floor(0.5 * (settings.reserveTokens + settings.keepRecentTokens)),
 		model.maxTokens > 0 ? model.maxTokens : Number.POSITIVE_INFINITY,
-	); // Smaller budget for turn prefix
+	);
 	const llmMessages = convertToLlm(messages);
 	const conversationText = serializeConversation(llmMessages);
 	const promptText = `# Conversation\n${conversationText}\n\n# Instructions\n${TURN_PREFIX_SUMMARIZATION_PROMPT}`;
 
-	const response = await completeSummarization(
+	const context = buildSummarizationContext(promptText);
+	const completionOptions = createSummarizationOptions(
 		model,
-		buildSummarizationContext(promptText),
-		createSummarizationOptions(model, maxTokens, apiKey, headers, env, signal, thinkingLevel, sessionId),
-		streamFn,
-		retry,
-		callbacks,
+		maxTokens,
+		apiKey,
+		headers,
+		env,
+		signal,
+		thinkingLevel,
+		sessionId,
 	);
+	let response = await completeSummarization(model, context, completionOptions, streamFn, retry, callbacks);
+	if (response.stopReason === "length" && model.maxTokens > 0 && maxTokens < model.maxTokens) {
+		completionOptions.maxTokens = model.maxTokens;
+		response = await completeSummarization(model, context, completionOptions, streamFn, retry, callbacks);
+	}
 
 	const failure = getSummarizationFailure(response, "Turn prefix summarization");
 	if (failure) {

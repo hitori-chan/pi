@@ -59,7 +59,14 @@ describe("issue #9178: tree navigation during manual compaction", () => {
 		}
 		await compactionPromise;
 
-		expect(harness.sessionManager.getEntries().at(-1)).toMatchObject({
+		// Fork: the mid-run hook records an invisible diagnostic custom entry after
+		// the compaction entry, so assert on the last non-diagnostic entry.
+		const lastEntry =
+			harness.sessionManager
+				.getEntries()
+				.filter((entry) => entry.type !== "custom")
+				.at(-1) ?? harness.sessionManager.getEntries().at(-1);
+		expect(lastEntry).toMatchObject({
 			type: "compaction",
 			parentId: originalLeafId,
 		});
