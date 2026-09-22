@@ -59,6 +59,7 @@ import { type BashResult, executeBashWithOperations } from "./bash-executor.ts";
 import { generateBugReportSummary } from "./bug-report.ts";
 import type { CacheWarmer, CacheWarmingStatus } from "./cache-warmer.ts";
 import {
+	CONTEXT_EVICT_CUSTOM_TYPE,
 	type CompactionPreparation,
 	type CompactionResult,
 	type CompactionSettings,
@@ -71,6 +72,7 @@ import {
 	generateBranchSummary,
 	MAX_NUDGES_PER_RUN,
 	MIDRUN_CUSTOM_TYPE,
+	planStaleToolResultEvictions,
 	prepareCompaction,
 	RESUME_PROMPT_COMPACTED,
 	RESUME_PROMPT_PLAIN,
@@ -125,6 +127,7 @@ import {
 	getLatestCompactionEntry,
 	type SessionEntry,
 	SessionManager,
+	type SessionProjection,
 } from "./session-manager.ts";
 import type { CacheWarmingMode, SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
@@ -602,10 +605,15 @@ export class AgentSession {
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings(model);
-		const projection = this.sessionManager.buildSessionProjection();
+		let projection = this.sessionManager.buildSessionProjection();
 
 		if (model && model.contextWindow > 0 && settings.enabled) {
 			this._midrunMaybeSteer(projection.messages, model, settings);
+			if (this._maybeEvictStaleToolResults(projection, model, settings)) {
+				// The edits invalidate the last usage; the threshold check below
+				// re-estimates from the trimmed projection.
+				projection = this.sessionManager.buildSessionProjection();
+			}
 		}
 
 		if (
@@ -622,6 +630,47 @@ export class AgentSession {
 
 		await this._runAutoCompaction("threshold", false);
 		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
+	}
+
+	/**
+	 * Evict stale tool results before threshold compaction (fork).
+	 *
+	 * When the context estimate is already at the compaction line, a full
+	 * compaction is avoidable if the overage is oversized tool output the model
+	 * has already consumed: omit it via append-only context edits. If eviction
+	 * cannot reach line − buffer, or there is nothing evictable, the normal
+	 * compaction check runs unchanged.
+	 */
+	private _maybeEvictStaleToolResults(
+		projection: SessionProjection,
+		model: Model<any>,
+		settings: CompactionSettings,
+	): boolean {
+		if (!this.settingsManager.getCompactionEvict()) return false;
+		const branch = this.sessionManager.getBranch();
+		const tokens = estimateProjectedContextTokens(projection, branch).tokens;
+		if (tokens <= 0) return false;
+		if (!shouldCompact(tokens, model.contextWindow, settings)) return false;
+		const line = model.contextWindow - settings.reserveTokens;
+		const targetIds = planStaleToolResultEvictions(projection, branch, {
+			tokens,
+			line,
+			bufferTokens: rearmDeltaTokens(model.contextWindow),
+		});
+		if (targetIds.length === 0) return false;
+		try {
+			for (const targetId of targetIds) {
+				this.sessionManager.appendContextEdit(targetId, null);
+			}
+			this.sessionManager.appendCustomEntry(CONTEXT_EVICT_CUSTOM_TYPE, {
+				targetIds,
+				tokensBefore: tokens,
+				line,
+			});
+		} catch {
+			// Edits are best-effort; fall through to the normal compaction check.
+		}
+		return true;
 	}
 
 	private _installAgentRequestProjection(): void {

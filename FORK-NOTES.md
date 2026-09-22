@@ -57,9 +57,10 @@ so extension payloads do not diverge.
 
 ### `src/core/settings-manager.ts`
 
-- New `compaction.thinkingLevel` (default `"off"`, `"inherit"` = session level) and
-  `compaction.midRunReserveTokens` (default 16,384) settings, surfaced as
-  `getCompactionThinkingLevel()` / `getCompactionMidRunReserveTokens()`.
+- New `compaction.thinkingLevel` (default `"off"`, `"inherit"` = session level),
+  `compaction.midRunReserveTokens` (default 16,384), and `compaction.evict` (default
+  `true`) settings, surfaced as `getCompactionThinkingLevel()` /
+  `getCompactionMidRunReserveTokens()` / `getCompactionEvict()`.
   `getCompactionSettings()` keeps the upstream shape (enabled + resolved token budgets,
   including per-model overrides) so `session_before_compact` payloads do not diverge.
 
@@ -91,6 +92,31 @@ into core (invisible custom messages, system-note style):
 - Diagnostics are appended as `customType: "midrun-autocompact"` session entries
   (phases: `steer`, `compacted`, `resuming`, `settled`, `resume-skipped`,
   `resume-cancelled`) — visible in the session file, never in the TUI.
+
+### `src/core/compaction/evict.ts` + `src/core/agent-session.ts`
+
+Stale tool-result eviction, built on v0.87.0's append-only context edits
+(`sessionManager.appendContextEdit(targetId, null)` = omission; raw history, usage
+records, and the UI transcript untouched). The external `context-evict` extension was
+dissolved into this module (the pi-extensions repo no longer exists locally; the
+GitHub remote keeps the midrun pre-fork history).
+
+- The first crossing of the compaction line still compacts: a result that just entered
+  the context is the trailing run (the model is about to read it) and is protected.
+  In a long tool loop, however, every later response carrying the same oversized
+  results re-crosses the line — each re-compaction is a minutes-long summarization
+  pass on local models. Eviction exists to stop that repetition.
+- In `_compactBeforeNextAssistantResponse`, before the threshold check: when the
+  estimate is already at the line, evict candidate results via context edits, rebuild
+  the projection, and let the existing check run on the trimmed context. If it still
+  says compact, the normal (bounded) compaction runs.
+- Candidates: entries made up solely of tool results, ≥ 4,096 tokens, with at least
+  one *healthy* assistant response (stop/toolUse — not length/error/aborted) after
+  them, not the trailing run, and not already targeted by a context edit. Largest
+  first, evicted until the estimate is at or below `line − max(8192, 5% of window)`.
+- Kill switch: `compaction.evict: false`. Diagnostics: one
+  `customType: "context-evict"` entry per eviction batch (TUI-invisible without a
+  renderer; the `context_edit` entries themselves are the audit trail).
 
 ## Settings for the model above
 
@@ -124,13 +150,17 @@ into core (invisible custom messages, system-note style):
 - Fork: `test/compaction-summary-reasoning.test.ts` (thinking pass-through, cap, length
   retry), `test/suite/agent-session-midrun.test.ts` (steer → mid-run compaction →
   invisible resume; silence below the line; summarizer thinking-level resolution:
-  default off / inherit / concrete), `test/suite/regressions/7048-…`.
+  default off / inherit / concrete), `test/suite/agent-session-context-evict.test.ts`
+  (eviction prevents a second compaction on a consumed oversized result; silence below
+  the line; compaction when nothing is evictable; the `compaction.evict: false`
+  control compacts repeatedly; multi-eviction until below the buffered line),
+  `test/suite/regressions/7048-…`.
 - Upstream tests adapted to fork behavior:
   `test/suite/agent-session-compaction-model-overrides.test.ts` (summary budgets now
   include the kept-recent slack: `0.8 × (reserve + keepRecent)`) and
   `test/suite/regressions/9178-…` (ignore the fork's invisible midrun diagnostic
   entries when asserting on the last session entry).
-- coding-agent suite: 2,412 passed, 50 skipped, 0 failed; monorepo `./test.sh`: 5,108
+- coding-agent suite: 2,417 passed, 50 skipped, 0 failed; monorepo `./test.sh`: 5,113
   passed, 904 skipped, 0 failed (run after `npm run build`; the workspace test suites
   resolve against the built `dist` of the workspace packages).
 

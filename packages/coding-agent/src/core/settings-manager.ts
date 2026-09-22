@@ -38,6 +38,8 @@ export interface CompactionSettings {
 	thinkingLevel?: CompactionThinkingLevel;
 	/** Steer a running tool loop to wrap up this many tokens before the line. Default: 16384 */
 	midRunReserveTokens?: number;
+	/** Evict stale tool results via context edits instead of compacting at the line. Default: true */
+	evict?: boolean;
 }
 
 export interface BranchSummarySettings {
@@ -911,6 +913,11 @@ export class SettingsManager {
 
 	getCompactionMidRunReserveTokens(): number {
 		return this.settings.compaction?.midRunReserveTokens ?? 16384;
+	}
+
+	/** Whether stale tool-result eviction is enabled at the compaction line. */
+	getCompactionEvict(): boolean {
+		return this.settings.compaction?.evict ?? true;
 	}
 
 	/** Resolve each token setting through model override, ordinary setting, then built-in default. */
