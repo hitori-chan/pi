@@ -1,6 +1,6 @@
 # Fork notes
 
-Fork of [earendil-works/pi](https://github.com/earendil-works/pi) at `v0.87.0` (branch
+Fork of [earendil-works/pi](https://github.com/earendil-works/pi) at `v0.87.1` (branch
 `compaction-fix`), maintained for local use only (no upstream PR). All changes are in
 `packages/coding-agent`.
 
@@ -39,6 +39,22 @@ content) with the new `estimateProjectedContextTokens`, and the run-end drain bl
 follows the reshaped `_handlePostAgentRun` (new `_checkCompaction(message, true,
 toolResults)` signature). `getCompactionSettings()` stays in the upstream 3-field shape
 so extension payloads do not diverge.
+
+**v0.87.1 patch review** (upstream `v0.87.0..v0.87.1`): no changes to any fork-touched
+logic. The coding-agent diff is the turn-prefix summarization prompt rewrite (#9908,
+regression for #9652: avoid split-turn summary refusals — new
+`TURN_PREFIX_SUMMARIZATION_PROMPT` wording, `# Conversation`/`# Instructions` markdown
+boundaries replacing `<conversation>`) inside `generateTurnPrefixSummary`, plus CLI
+`--mode` validation and new AI-provider models. The fork's cap formula sits just above
+that function and the length retry below it; the rebase applied with zero conflicts and
+no fork test asserts on the old prompt strings, so no adaptation was needed. All three
+fixes and eviction remain as-is.
+
+Bump tooling note: `packages/ai/src/providers/data/` (model catalog JSON) is gitignored
+and generated at build time. A stale local copy makes `tsgo` fail when an upstream
+release adds tests referencing newer models (hit on this bump: GPT-6 Sol/Luna); fix
+with `npm --prefix packages/ai run generate-models` (fetches the live models.dev /
+OpenRouter catalogs).
 
 ## Changes
 
@@ -160,8 +176,8 @@ GitHub remote keeps the midrun pre-fork history).
   include the kept-recent slack: `0.8 × (reserve + keepRecent)`) and
   `test/suite/regressions/9178-…` (ignore the fork's invisible midrun diagnostic
   entries when asserting on the last session entry).
-- coding-agent suite: 2,417 passed, 50 skipped, 0 failed; monorepo `./test.sh`: 5,113
-  passed, 904 skipped, 0 failed (run after `npm run build`; the workspace test suites
+- coding-agent suite: 2,423 passed, 50 skipped, 0 failed; monorepo `./test.sh`: 5,202
+  passed, 907 skipped, 0 failed (run after `npm run build`; the workspace test suites
   resolve against the built `dist` of the workspace packages).
 
 ## Install (this machine)
@@ -176,7 +192,7 @@ npm uninstall -g @earendil-works/pi-coding-agent
 cd <this repo> && npm run build        # before tests and packing
 cd packages/coding-agent && npm pack
 npm install -g --ignore-scripts --min-release-age=0 \
-  --no-fund --no-audit earendil-works-pi-coding-agent-0.87.0.tgz
+  --no-fund --no-audit earendil-works-pi-coding-agent-0.87.1.tgz
 ```
 
 `--min-release-age=0` matches the installer: local npm config gates registry
