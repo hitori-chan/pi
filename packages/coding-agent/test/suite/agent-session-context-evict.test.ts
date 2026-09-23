@@ -133,6 +133,100 @@ describe("stale tool-result eviction", () => {
 		expect(compactionCount(harness)).toBe(1);
 	});
 
+	it("does not steer when eviction resolves the crossing", async () => {
+		// keepRecent 50000 > the big result: the first crossing compacts to
+		// nothing (no summarizable prefix), so the only question is whether the
+		// consumed result later stops the run. Steer line = line = 32000.
+		const settings = {
+			compaction: {
+				enabled: true,
+				reserveTokens: 8000,
+				keepRecentTokens: 50000,
+				midRunReserveTokens: 8000,
+			},
+		};
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 40000, maxTokens: 2000 }],
+			settings,
+			tools: [makeTool("big", "EVICT-MARKER-A", BIG_CHARS), makeTool("small", "EVICT-MARKER-S", 14)],
+			extensionFactories: [makeSummarizingFactory()],
+		});
+		harnesses.push(harness);
+
+		const requests: string[] = [];
+		const next =
+			(body: Parameters<typeof fauxAssistantMessage>[0], stopReason?: "toolUse") =>
+			(context: { messages: unknown[] }) => {
+				requests.push(JSON.stringify(context.messages));
+				return fauxAssistantMessage(body, stopReason ? { stopReason } : undefined);
+			};
+		harness.setResponses([
+			next(fauxToolCall("big", {}), "toolUse"),
+			next(fauxToolCall("small", {}), "toolUse"),
+			next("done"),
+		]);
+
+		await harness.session.prompt("run the big tool");
+
+		expect(requests).toHaveLength(3);
+		expect(requests[2]).not.toContain("EVICT-MARKER-A");
+		expect(requests[2]).toContain("EVICT-MARKER-S");
+		// The crossing after the digest was resolved by eviction: no steer note,
+		// no compaction, the run finished on its own.
+		const midrun = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === "midrun-autocompact");
+		expect(midrun).toHaveLength(0);
+		expect(contextEdits(harness)).toHaveLength(1);
+		expect(compactionCount(harness)).toBe(0);
+	});
+
+	it("steers and re-compacts when eviction is off (control)", async () => {
+		const settings = {
+			compaction: {
+				enabled: true,
+				reserveTokens: 8000,
+				keepRecentTokens: 2000,
+				midRunReserveTokens: 8000,
+				evict: false,
+			},
+		};
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 40000, maxTokens: 2000 }],
+			settings,
+			tools: [makeTool("big", "EVICT-MARKER-A", BIG_CHARS), makeTool("small", "EVICT-MARKER-S", 14)],
+			extensionFactories: [makeSummarizingFactory()],
+		});
+		harnesses.push(harness);
+
+		const requests: string[] = [];
+		const next =
+			(body: Parameters<typeof fauxAssistantMessage>[0], stopReason?: "toolUse") =>
+			(context: { messages: unknown[] }) => {
+				requests.push(JSON.stringify(context.messages));
+				return fauxAssistantMessage(body, stopReason ? { stopReason } : undefined);
+			};
+		harness.setResponses([
+			next(fauxToolCall("big", {}), "toolUse"),
+			next(fauxToolCall("small", {}), "toolUse"),
+			next("done"),
+		]);
+
+		await harness.session.prompt("run the big tool");
+
+		expect(requests).toHaveLength(3);
+		// Without eviction the consumed big result keeps every later request
+		// over the line: the run is steered to stop and re-compacts.
+		expect(requests.some((r) => r.includes("[System note] Context is at"))).toBe(true);
+		const steerPhases = harness.sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "custom" && entry.customType === "midrun-autocompact")
+			.map((entry) => (entry as { data?: { phase?: string } }).data?.phase);
+		expect(steerPhases.filter((phase) => phase === "steer")).toHaveLength(1);
+		expect(contextEdits(harness)).toHaveLength(0);
+		expect(compactionCount(harness)).toBe(2);
+	});
+
 	it("stays silent below the compaction line", async () => {
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: 40000, maxTokens: 2000 }],

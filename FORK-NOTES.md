@@ -100,6 +100,12 @@ into core (invisible custom messages, system-note style):
 - When a still-running tool loop crosses the steer line — `contextWindow −
   max(midRunReserveTokens, reserveTokens)` — an invisible note asks the model to
   converge in-flight work and end the turn, so native compaction runs on a settled state.
+- The steer decision is two-sided: the last provider-measured context (the usage
+  anchor) must already be at the line, and the *post-eviction* projection must
+  still be (eviction runs first in the same check). A crossing that a context edit
+  just resolved — or one that is only a trailing result the model is about to read
+  (evictable after the digest) — never stops the run. The note's percentage is the
+  post-eviction projection estimate, the same number the TUI footer shows.
 - Only `toolUse` stops are steered; at most one nudge per 8,192-token rise (max two per
   run); `stop` never triggers (a finished turn is not restarted — resume only follows a
   mid-run compaction).
@@ -122,10 +128,12 @@ GitHub remote keeps the midrun pre-fork history).
   In a long tool loop, however, every later response carrying the same oversized
   results re-crosses the line — each re-compaction is a minutes-long summarization
   pass on local models. Eviction exists to stop that repetition.
-- In `_compactBeforeNextAssistantResponse`, before the threshold check: when the
-  estimate is already at the line, evict candidate results via context edits, rebuild
-  the projection, and let the existing check run on the trimmed context. If it still
-  says compact, the normal (bounded) compaction runs.
+- In `_compactBeforeNextAssistantResponse`, the pre-response layering is
+  evict → steer → compact: first evict candidate results via context edits (free,
+  no interruption) and rebuild the projection; then the steer check runs on the
+  post-eviction projection (see above); finally the existing threshold check runs
+  on the same projection, and only if it still says compact does the normal
+  (bounded) compaction run.
 - Candidates: entries made up solely of tool results, ≥ 4,096 tokens, with at least
   one *healthy* assistant response (stop/toolUse — not length/error/aborted) after
   them, not the trailing run, and not already targeted by a context edit. Largest
@@ -176,7 +184,7 @@ GitHub remote keeps the midrun pre-fork history).
   include the kept-recent slack: `0.8 × (reserve + keepRecent)`) and
   `test/suite/regressions/9178-…` (ignore the fork's invisible midrun diagnostic
   entries when asserting on the last session entry).
-- coding-agent suite: 2,423 passed, 50 skipped, 0 failed; monorepo `./test.sh`: 5,202
+- coding-agent suite: 2,425 passed, 50 skipped, 0 failed; monorepo `./test.sh`: 5,204
   passed, 907 skipped, 0 failed (run after `npm run build`; the workspace test suites
   resolve against the built `dist` of the workspace packages).
 

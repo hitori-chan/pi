@@ -608,12 +608,15 @@ export class AgentSession {
 		let projection = this.sessionManager.buildSessionProjection();
 
 		if (model && model.contextWindow > 0 && settings.enabled) {
-			this._midrunMaybeSteer(projection.messages, model, settings);
+			// Evict first: a free context edit can resolve the crossing without
+			// interrupting the run. Steer (stop the turn) only when the overage
+			// survives eviction, judged on the post-eviction projection.
 			if (this._maybeEvictStaleToolResults(projection, model, settings)) {
-				// The edits invalidate the last usage; the threshold check below
+				// The edits invalidate the last usage; everything below
 				// re-estimates from the trimmed projection.
 				projection = this.sessionManager.buildSessionProjection();
 			}
+			this._midrunMaybeSteer(projection, model, settings);
 		}
 
 		if (
@@ -766,9 +769,10 @@ export class AgentSession {
 	 * run (boundary compaction handles it); "length"/"error"/"aborted" belong to
 	 * pi's recovery, retry, and the user.
 	 */
-	private _midrunMaybeSteer(messages: AgentMessage[], model: Model<any>, settings: CompactionSettings): void {
+	private _midrunMaybeSteer(projection: SessionProjection, model: Model<any>, settings: CompactionSettings): void {
 		if (!this.isStreaming) return;
 
+		const messages = projection.messages;
 		let lastAssistant: AssistantMessage | undefined;
 		for (let i = messages.length - 1; i >= 0; i--) {
 			if (messages[i].role === "assistant") {
@@ -776,10 +780,14 @@ export class AgentSession {
 				break;
 			}
 		}
-		if (!lastAssistant || lastAssistant.stopReason !== "toolUse") return;
-		const usage = lastAssistant.usage;
-		if (!usage) return;
-		const tokens = calculateContextTokens(usage);
+		// Only steer mid tool-loop, and only with a real usage anchor.
+		if (!lastAssistant || lastAssistant.stopReason !== "toolUse" || !lastAssistant.usage) return;
+		const anchor = calculateContextTokens(lastAssistant.usage);
+
+		// Post-eviction projected estimate: what the next request will actually
+		// contain. If eviction already resolved the crossing, the run continues
+		// and no note is sent (the note's percentage matches the TUI's).
+		const tokens = estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens;
 		if (tokens <= 0) return;
 
 		// Steer at or before pi's hard compaction line, so the wrap-up pushes
@@ -790,15 +798,23 @@ export class AgentSession {
 		const threshold = model.contextWindow - reserve;
 		const rearmDelta = rearmDeltaTokens(model.contextWindow);
 
+		// Steer only when the crossing is both real (the last measured context
+		// already sat at the line) and not eviction-resolvable (the
+		// post-eviction projection still does). A crossing that eviction just
+		// resolved is no reason to stop the run; a crossing that is only a
+		// trailing result the model is about to read becomes evictable after
+		// the digest, so it is not one either.
+
 		let phase: "steer" | "re-steer";
 		if (this._midrunAwaitingSettle) {
 			// Already steered this run: at most one stronger re-nudge, and only
 			// after real growth since the last steer.
 			if (this._midrunNudges >= MAX_NUDGES_PER_RUN) return;
+			if (anchor < threshold || tokens < threshold) return;
 			if (tokens < this._midrunLastSteerTokens + rearmDelta) return;
 			phase = "re-steer";
 		} else {
-			if (tokens < threshold) return;
+			if (anchor < threshold || tokens < threshold) return;
 			// Cross-run hysteresis: after a steer whose wrap-up settled below the
 			// line, usage is already above the threshold again — wait for real
 			// growth before steering the next run.

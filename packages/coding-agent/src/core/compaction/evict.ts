@@ -11,10 +11,11 @@
  * context edits (replacement: null) is free: raw history, usage records, and
  * the UI transcript are untouched, only future provider requests change.
  *
- * Layers under mid-run steering: steer (soft nudge) → evict (free, targeted)
- * → compact (last resort). If eviction cannot bring the estimate below
- * line − buffer, or there is nothing evictable, the normal compaction runs
- * unchanged.
+ * Layers in the pre-response check: evict (free, targeted) → steer (soft
+ * nudge) → compact (last resort). Steer only fires when the overage survives
+ * eviction, so a crossing that a context edit already resolved never stops
+ * the run. If eviction cannot bring the estimate below line − buffer, or
+ * there is nothing evictable, the normal compaction runs unchanged.
  *
  * Policy (conservative):
  * - A tool result is a candidate once at least one healthy assistant response
